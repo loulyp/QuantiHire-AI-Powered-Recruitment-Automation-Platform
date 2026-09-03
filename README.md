@@ -1,4 +1,4 @@
-# QuantaHire: AI-Powered Smart Recruitment Engine
+# QuantiHire – AI-Powered Recruitment Automation Platform
 
 **QuantaHire** is an end-to-end AI recruitment platform that automates candidate screening, eliminates human bias, and delivers transparent feedback. It uses a two-stage **Retrieval-Augmented Generation (RAG)** pipeline to semantically match candidates to job descriptions, ensuring fast, fair, and explainable hiring decisions.
 
