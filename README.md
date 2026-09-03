@@ -62,4 +62,3 @@ QuantaHire solves these issues by acting as an **"AI Recruiting Agent"** that ha
 | **NDCG@10** | **1.000** | Perfect ranking order within the top 10 results. |
 | **Test Coverage** | **170+** | All Admin, Recruiter, Candidate portal tests passed. |
 | **CVs Processed** | **100+** | Real‑world test dataset across 5 job domains. |
-| **Time Saved** | **~60%** | Recruiter screening time reduced by AI automation. 
