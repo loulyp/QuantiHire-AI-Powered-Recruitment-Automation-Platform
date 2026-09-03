@@ -1,0 +1,22 @@
+.DS_Store
+
+# Frontend
+quantahire-frontend/node_modules/
+quantahire-frontend/dist/
+quantahire-frontend/.env
+quantahire-frontend/.env.*
+
+# Backend
+quantahire-backend/__pycache__/
+quantahire-backend/.venv/
+quantahire-backend/venv/
+quantahire-backend/.env
+quantahire-backend/.env.*
+
+# Python
+__pycache__/
+*.pyc
+
+# IDE
+.vscode/
+.idea/

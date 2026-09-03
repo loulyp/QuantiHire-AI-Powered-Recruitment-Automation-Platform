@@ -1,0 +1,392 @@
+# services/matcher.py  —  Full RAG pipeline with per-job knowledge graph.
+
+import os
+os.environ["FLAGS_use_onednn"] = "0"
+os.environ["FLAGS_use_mkldnn"] = "0"
+os.environ["PADDLE_PDX_ENABLE_MKLDNN_BYDEFAULT"] = "0"
+os.environ["PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK"] = "True"
+
+import numpy as np
+from sklearn.metrics.pairwise import cosine_similarity
+from raganything import RAGAnything, RAGAnythingConfig
+from lightrag.utils import EmbeddingFunc
+from config import TOP_K_FOR_LLM, RAG_STORAGE, WEIGHT_SIM, WEIGHT_LLM, MAX_ROUNDS
+from services.llm import llm_func, vision_func
+from services.embeddings import hf_embedding_func, embedding_func
+
+# One RAGAnything instance per job_id, keyed by job_id string
+_rag_instances: dict[str, RAGAnything] = {}
+# Tracks which CV paths have already been indexed in the per-job RAG graph during this process lifetime
+_indexed_cvs: dict[str, set[str]] = {}
+
+
+def get_rag_for_job(job_id: str) -> RAGAnything:
+    """Return a cached (or newly created) RAGAnything instance for this job."""
+    if job_id in _rag_instances:
+        return _rag_instances[job_id]
+
+    job_storage = os.path.join(RAG_STORAGE, job_id)
+    os.makedirs(job_storage, exist_ok=True)
+
+    config = RAGAnythingConfig(
+        working_dir=job_storage,
+        parser="paddleocr",
+        parse_method="auto",
+        enable_image_processing=False,
+        enable_table_processing=True,
+        enable_equation_processing=False,
+        display_content_stats=False,
+    )
+    rag = RAGAnything(
+        config=config,
+        llm_model_func=llm_func,
+        vision_model_func=vision_func,
+        embedding_func=embedding_func,
+    )
+    _rag_instances[job_id] = rag
+    return rag
+
+
+async def index_cv_into_rag(cv_path: str, job_id: str) -> bool:
+    """
+    Parse and index a CV file into the knowledge graph for a specific job.
+    Called once at upload time. Returns True on success.
+    """
+    if not os.path.exists(cv_path):
+        print(f"[RAG index] File not found: {cv_path}")
+        return False
+
+    if job_id not in _indexed_cvs:
+        _indexed_cvs[job_id] = set()
+    if cv_path in _indexed_cvs[job_id]:
+        return True
+
+    rag = get_rag_for_job(job_id)
+    try:
+        await rag.process_document_complete(
+            file_path=cv_path,
+            output_dir=os.path.join(RAG_STORAGE, job_id, "parsed"),
+        )
+        print(f"[RAG index] Indexed {os.path.basename(cv_path)} into job graph '{job_id}'")
+        _indexed_cvs[job_id].add(cv_path)
+        return True
+    except Exception as e:
+        print(f"[RAG index] Failed to index {cv_path}: {e}")
+        return False
+
+
+SCORE_SYSTEM = (
+    "You are a professional HR that rates resumes. Generate a score on the scale 1-5 for each "
+    "work experience match, skills match, educational background match and certifications/extracurricular "
+    "match based on the job description summary and resume. Additionally provide the reasons for the "
+    "generated rating. Rate candidate resumes accurately and fairly:\n"
+    "- 5: Perfect match (covers all or almost all key requirements and experience levels)\n"
+    "- 4: Good match (covers most key requirements with minor gaps)\n"
+    "- 3: Moderate match (covers some requirements, suitable with training)\n"
+    "- 2: Weak match (major gaps in skills or experience)\n"
+    "- 1: No match (unrelated profile)\n\n"
+    "The format of the output should be exactly like following:\n\n"
+    "Rating: \n"
+    "Work Experience Match: \n"
+    "Skills Match: \n"
+    "Educational Background Match\n"
+    "Certifications/Extracurricular Match: \n\n"
+    "Reasons for rating:\n"
+)
+
+REWRITE_SYSTEM = (
+    "You are an expert HR recruiter. The search query did not find "
+    "the right candidates according to the recruiter's feedback.\n"
+    "The recruiter rates candidates on: work experience, skills, education, and certifications.\n"
+    "Rewrite the query to better match what the recruiter wants, focusing on these four areas.\n"
+    "Output ONLY the new search query, nothing else."
+)
+
+
+def parse_rating(resp: str):
+    import re
+    scores  = {"work_exp": 3, "skills": 3, "education": 3, "certifications": 3}
+    reasons = {"work_exp": "", "skills": "", "education": "", "certifications": ""}
+    lines   = resp.strip().split("\n")
+    in_rating, in_reasons = True, False
+    reason_accum = []
+
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        if "Rating:" in line:
+            continue
+        if "Reasons for rating:" in line:
+            in_rating, in_reasons = False, True
+            continue
+        if in_rating:
+            cleaned = line.replace("*", "").replace("-", "").strip()
+            cleaned = re.sub(r'^\d+[\.\)\s]+', '', cleaned).strip()
+            for key, prefix in [
+                ("work_exp",       "Work Experience Match"),
+                ("skills",         "Skills Match"),
+                ("education",      "Educational Background Match"),
+                ("certifications", "Certifications/Extracurricular Match"),
+            ]:
+                if prefix.lower() in cleaned.lower():
+                    try:
+                        digits = re.findall(r'\b[1-5]\b', cleaned)
+                        if digits:
+                            scores[key] = int(digits[0])
+                    except Exception:
+                        pass
+        elif in_reasons:
+            reason_accum.append(line)
+
+    full  = " ".join(reason_accum)
+    parts = [p.strip() + "." for p in full.split(".") if p.strip()]
+    for i, key in enumerate(["work_exp", "skills", "education", "certifications"]):
+        reasons[key] = parts[i] if i < len(parts) else (full[:100] if i == 0 else "")
+    reasons["explanation"] = full
+    return scores, reasons
+
+
+def total_match_from_scores(scores: dict) -> float:
+    # Work Experience: 40%, Skills: 40%, Education: 10%, Certifications: 10%
+    weight_work_exp = 0.4
+    weight_skills = 0.4
+    weight_education = 0.1
+    weight_certifications = 0.1
+    
+    work_exp = scores.get("work_exp", 3)
+    skills = scores.get("skills", 3)
+    education = scores.get("education", 3)
+    certifications = scores.get("certifications", 3)
+    
+    avg = (
+        work_exp * weight_work_exp +
+        skills * weight_skills +
+        education * weight_education +
+        certifications * weight_certifications
+    )
+    total = (avg - 1) * 25
+    return max(0, min(100, round(total, 1)))
+
+
+def hybrid_score(similarity: float, llm_total: float) -> float:
+    return round(WEIGHT_SIM * similarity + WEIGHT_LLM * llm_total, 1)
+
+
+async def llm_score(jd_text: str, cv_context: str, feedback_query: str = None):
+    focus_instruction = ""
+    if feedback_query:
+        focus_instruction = (
+            f"Recruiter Feedback / Priorities to focus on:\n{feedback_query}\n"
+            f"Evaluate and score the candidate's categories strictly focusing on these priorities.\n\n"
+        )
+    prompt = (
+        f"Job description summary:\n{jd_text[:3000]}\n\n"
+        f"{focus_instruction}"
+        f"Resume content:\n{(cv_context or '')[:5000]}"
+    )
+    try:
+        resp            = await llm_func(prompt=prompt, system_prompt=SCORE_SYSTEM)
+        scores, reasons = parse_rating(resp)
+        total           = total_match_from_scores(scores)
+        verdict = (
+            f"WE:{scores['work_exp']} Sk:{scores['skills']} "
+            f"Ed:{scores['education']} Cert:{scores['certifications']} "
+            f"| {reasons['skills'][:60]}"
+        )
+        return total, verdict, scores, reasons
+    except Exception as e:
+        print(f"[LLM score] error: {e}")
+        return 50, f"LLM error: {str(e)[:100]}", {}, {}
+
+
+def build_query(cv_id: str, category: str, jd_text: str) -> str:
+    return (
+        f"Skills and experience of '{cv_id}' in {category}. "
+        f"Relevant to: {jd_text[:2000]}"
+    )
+
+
+async def rewrite_query(jd_text: str, current_query: str, feedback: str, history=None) -> str:
+    print(f"\n=== REWRITE QUERY ===")
+    print(f"Original query: {current_query}")
+    print(f"Feedback: {feedback}")
+
+    history_text = ""
+    if history:
+        history_text = "\nPREVIOUS ATTEMPTS:\n"
+        for h in history:
+            history_text += (
+                f"  Round {h['round']}: Top was {h['top_cv']} "
+                f"(score {h['top_score']})\n"
+            )
+            if h.get("feedback"):
+                history_text += f"    Recruiter: {h['feedback']}\n"
+
+    prompt = (
+        f"JOB DESCRIPTION:\n{jd_text[:400]}\n\n"
+        f"CURRENT QUERY:\n{current_query}\n\n"
+        f"RECRUITER FEEDBACK:\n{feedback}\n"
+        f"{history_text}\n"
+        "Write an improved search query. Output ONLY the query."
+    )
+    try:
+        result = await llm_func(prompt=prompt, system_prompt=REWRITE_SYSTEM)
+        print(f"New query: {result}")
+        return result.strip() if result else current_query
+    except Exception:
+        return current_query
+
+
+async def rank_cvs(jd_text: str, cv_records: list, job_id: str, query_override: dict = None) -> list:
+    """
+    Two-stage ranking for a specific job's candidates.
+    cv_records: list of dicts with keys: cv_id, text, category
+    job_id: used to load the correct per-job RAG graph
+    Returns: list of result dicts sorted by final_score descending
+    """
+    print(f"\n=== RANKING DEBUG ===")
+    print(f"Job description length: {len(jd_text)}")
+    print(f"Number of CVs to rank: {len(cv_records)}")
+    print(f"TOP_K_FOR_LLM setting: {TOP_K_FOR_LLM}")
+
+    rag = get_rag_for_job(job_id)
+
+    # Stage A similarity target text
+    uniform_query = None
+    if query_override:
+        unique_queries = set(query_override.values())
+        if len(unique_queries) == 1:
+            uniform_query = list(unique_queries)[0]
+
+    if uniform_query:
+        print(f"[rank_cvs] Using uniform query override for Stage A similarity: '{uniform_query}'")
+        target_emb = await hf_embedding_func([uniform_query])
+    else:
+        target_emb = await hf_embedding_func([jd_text])
+
+    sim_scores = []
+    for cv in cv_records:
+        text = cv.get("text", "")
+        if not text:
+            sim_scores.append((cv, 0.0))
+            continue
+        cv_emb = await hf_embedding_func([text])
+        if query_override and not uniform_query:
+            cv_query = query_override.get(cv["cv_id"], jd_text)
+            curr_target_emb = await hf_embedding_func([cv_query])
+            sim = cosine_similarity(curr_target_emb, cv_emb)[0][0]
+        else:
+            sim = cosine_similarity(target_emb, cv_emb)[0][0]
+        sim_scores.append((cv, round(max(0.0, float(sim)) * 100, 1)))
+
+    sim_scores.sort(key=lambda x: x[1], reverse=True)
+    top_k = sim_scores[:TOP_K_FOR_LLM]
+    rest  = sim_scores[TOP_K_FOR_LLM:]
+
+    print(f"[rank_cvs] job={job_id} | total={len(cv_records)} | top_k={len(top_k)} | rest={len(rest)}")
+
+    rows = []
+
+    for cv, sim_score in top_k:
+        query   = (query_override or {}).get(cv["cv_id"], build_query(cv["cv_id"], cv.get("category", "General"), jd_text))
+        cv_text = cv.get("text", "")
+
+        # On-the-fly RAG indexing if not already indexed
+        cv_path = cv.get("path")
+        if cv_path and os.path.exists(cv_path):
+            await index_cv_into_rag(cv_path, job_id)
+
+        rag_ctx = ""
+        try:
+            rag_ctx = await rag.aquery(query=query, mode="hybrid", top_k=10)
+            if rag_ctx and len(rag_ctx.strip()) > 100:
+                print(f"[rank_cvs] RAG context retrieved for {cv['cv_id']} ({len(rag_ctx)} chars)")
+            else:
+                rag_ctx = ""
+                print(f"[rank_cvs] RAG returned empty for {cv['cv_id']} — using raw CV text only")
+        except Exception as e:
+            print(f"[rank_cvs] RAG query error for {cv['cv_id']}: {e}")
+
+        context = cv_text + ("\n\n" + rag_ctx if rag_ctx else "")
+        feedback_query = query_override.get(cv["cv_id"]) if query_override else None
+        llm_total, verdict, scores, reasons = await llm_score(jd_text, context, feedback_query=feedback_query)
+        final = hybrid_score(sim_score, llm_total)
+
+        print(f"\n--- CV: {cv.get('cv_id')} ---")
+        print(f"CV text length: {len(cv.get('text', ''))}")
+        print(f"Similarity score: {sim_score}")
+        print(f"LLM total score: {llm_total}")
+        print(f"Scores breakdown: {scores}")
+        print(f"Final score: {final}")
+
+        rows.append({
+            "cv_id":       cv["cv_id"],
+            "filename":    cv.get("original_filename", cv["cv_id"]),
+            "category":    cv.get("category", "General"),
+            "similarity":  sim_score,
+            "llm_total":   llm_total,
+            "final_score": final,
+            "verdict":     verdict,
+            "scores":      scores,
+            "reasons":     reasons,
+            "rag_used":    bool(rag_ctx),
+        })
+
+    for cv, sim_score in rest:
+        print(f"\n--- CV: {cv.get('cv_id')} (Rest - similarity only) ---")
+        print(f"CV text length: {len(cv.get('text', ''))}")
+        print(f"Similarity score: {sim_score}")
+        print(f"Final score: {sim_score}")
+
+        rows.append({
+            "cv_id":       cv["cv_id"],
+            "filename":    cv.get("original_filename", cv["cv_id"]),
+            "category":    cv.get("category", "General"),
+            "similarity":  sim_score,
+            "llm_total":   None,
+            "final_score": sim_score,
+            "verdict":     f"[Similarity only — ranked below top {TOP_K_FOR_LLM}]",
+            "scores":      {},
+            "reasons":     {},
+            "rag_used":    False,
+        })
+
+    rows.sort(key=lambda x: x["final_score"], reverse=True)
+    for i, row in enumerate(rows):
+        row["rank"] = i + 1
+    return rows
+
+
+async def generate_candidate_feedback(match_score: float, job_title: str, job_description: str, cv_summary: str = None) -> str:
+    prompt = (
+        f"You are a professional HR recruiter/assistant.\n"
+        f"Please generate a personalized feedback message for a candidate who applied to the '{job_title}' role.\n"
+        f"The candidate has a compatibility match score of {match_score}%.\n"
+    )
+    if job_description:
+        prompt += f"Job Description:\n{job_description[:1000]}\n\n"
+    if cv_summary:
+        prompt += f"Candidate CV/Resume summary/details:\n{cv_summary[:1500]}\n\n"
+    prompt += (
+        "Generate a professional, encouraging, and specific feedback message (about 2-4 sentences). "
+        "Address the candidate directly as 'you'. "
+        "Do not include headers or recruiter signatures. Write only the feedback text itself."
+    )
+    system_prompt = (
+        "You are an expert HR recruiter assistant. You write helpful, constructive, and professional "
+        "feedback messages directly addressed to candidates."
+    )
+    try:
+        feedback = await llm_func(prompt=prompt, system_prompt=system_prompt)
+        if feedback and feedback.strip():
+            return feedback.strip()
+    except Exception as e:
+        print(f"[feedback gen] error: {e}")
+
+    if match_score >= 80:
+        return f"Thank you for applying to the {job_title} position. Your profile shows a strong alignment with our requirements at {match_score}% match. We will contact you soon."
+    elif match_score >= 50:
+        return f"Thank you for your interest in the {job_title} role. Your qualifications match several key requirements with a {match_score}% compatibility score. We will keep you updated."
+    else:
+        return f"Thank you for your application for the {job_title} role. We appreciate your interest, but we have decided to focus on other applicants whose skills more closely fit our immediate needs."
